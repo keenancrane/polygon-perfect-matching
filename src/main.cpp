@@ -30,6 +30,8 @@ struct BenchmarkOptions {
     int exact_points = 0;
     bool validate = false;
     bool simple_scan = false;
+    bool optimized = false;
+    bool cost_only = false;
     bool skip_dp = false;
     bool skip_brute = false;
     std::uint64_t seed = 0;
@@ -71,6 +73,8 @@ void print_usage(std::ostream& os, const char* prog) {
        << "                           points (even, >= 2). Overrides --max-points.\n"
        << "  -v, --validate           Cross-check BF / DP / Paper on every trial\n"
        << "      --simple-scan        Benchmark only the O(N^2) scan variant\n"
+       << "      --optimized          Benchmark the exact hybrid optimized solver\n"
+       << "      --cost-only          Benchmark objective value only, not pair output\n"
        << "      --skip-dp            Skip DP regardless of N\n"
        << "      --skip-brute         Skip brute force regardless of N\n"
        << "      --seed <uint64>      Deterministic RNG seed\n"
@@ -135,6 +139,18 @@ bool parse_cli(int argc, char** argv, CliOptions& opts) {
             } else {
                 opts.match.simple_scan = true;
             }
+        } else if (a == "--cost-only") {
+            if (opts.mode != Mode::Benchmark) {
+                std::cerr << "--cost-only requires --benchmark\n";
+                return false;
+            }
+            opts.benchmark.cost_only = true;
+        } else if (a == "--optimized") {
+            if (opts.mode != Mode::Benchmark) {
+                std::cerr << "--optimized requires --benchmark\n";
+                return false;
+            }
+            opts.benchmark.optimized = true;
         } else if (a == "-t" || a == "--trials") {
             if (opts.mode != Mode::Benchmark) {
                 std::cerr << "-t/--trials requires --benchmark\n";
@@ -373,8 +389,14 @@ int run_benchmark(const BenchmarkOptions& opts) {
     }
     std::cout << "Seed      : " << seed << "\n";
     if (!opts.validate) {
-        std::cout << "Conquer   : "
-                  << (opts.simple_scan ? "simple-scan (O(N^2))" : "SMAWK (O(N))")
+        std::cout << "Conquer   : ";
+        if (opts.optimized) {
+            std::cout << "optimized exact hybrid";
+        } else {
+            std::cout << (opts.simple_scan ? "simple-scan (O(N^2))" : "SMAWK (O(N))");
+        }
+        std::cout << "\n";
+        std::cout << "Output    : " << (opts.cost_only ? "cost only" : "full matching")
                   << "\n";
     }
 
@@ -386,12 +408,14 @@ int run_benchmark(const BenchmarkOptions& opts) {
     std::int64_t total_ns_dp = 0;
     std::int64_t total_ns_paper_smawk = 0;
     std::int64_t total_ns_paper_scan = 0;
+    std::int64_t total_ns_optimized = 0;
     int trials_brute = 0;
     int trials_dp = 0;
     int trials_paper_smawk = 0;
     int trials_paper_scan = 0;
+    int trials_optimized = 0;
 
-    const bool run_smawk = opts.validate || !opts.simple_scan;
+    const bool run_smawk = opts.validate || opts.optimized || !opts.simple_scan;
     const bool run_scan = opts.validate || opts.simple_scan;
 
     for (int t = 0; t < opts.trials; ++t) {
@@ -418,20 +442,52 @@ int run_benchmark(const BenchmarkOptions& opts) {
         }
 
         mwpm::MatchingResult paper_smawk;
+        double paper_smawk_cost = 0.0;
         if (run_smawk) {
             t0 = Clock::now();
-            paper_smawk = mwpm::marcotte_suri_matching(points, /*simple_scan=*/false);
+            if (opts.validate) {
+                paper_smawk = mwpm::marcotte_suri_matching(points, /*simple_scan=*/false);
+                paper_smawk_cost = paper_smawk.cost;
+            } else if (opts.optimized && opts.cost_only) {
+                paper_smawk_cost = mwpm::optimized_cost(points);
+            } else if (opts.optimized) {
+                paper_smawk = mwpm::optimized_matching(points);
+                paper_smawk_cost = paper_smawk.cost;
+            } else if (opts.cost_only) {
+                paper_smawk_cost = mwpm::marcotte_suri_cost(points, /*simple_scan=*/false);
+            } else {
+                paper_smawk = mwpm::marcotte_suri_matching(points, /*simple_scan=*/false);
+                paper_smawk_cost = paper_smawk.cost;
+            }
             t1 = Clock::now();
             total_ns_paper_smawk += duration_cast<nanoseconds>(t1 - t0).count();
             ++trials_paper_smawk;
         }
         mwpm::MatchingResult paper_scan;
+        double paper_scan_cost = 0.0;
         if (run_scan) {
             t0 = Clock::now();
-            paper_scan = mwpm::marcotte_suri_matching(points, /*simple_scan=*/true);
+            if (opts.validate) {
+                paper_scan = mwpm::marcotte_suri_matching(points, /*simple_scan=*/true);
+                paper_scan_cost = paper_scan.cost;
+            } else if (opts.cost_only) {
+                paper_scan_cost = mwpm::marcotte_suri_cost(points, /*simple_scan=*/true);
+            } else {
+                paper_scan = mwpm::marcotte_suri_matching(points, /*simple_scan=*/true);
+                paper_scan_cost = paper_scan.cost;
+            }
             t1 = Clock::now();
             total_ns_paper_scan += duration_cast<nanoseconds>(t1 - t0).count();
             ++trials_paper_scan;
+        }
+
+        mwpm::MatchingResult optimized;
+        if (opts.validate) {
+            t0 = Clock::now();
+            optimized = mwpm::optimized_matching(points);
+            t1 = Clock::now();
+            total_ns_optimized += duration_cast<nanoseconds>(t1 - t0).count();
+            ++trials_optimized;
         }
 
         bool ran_brute = false;
@@ -449,15 +505,19 @@ int run_benchmark(const BenchmarkOptions& opts) {
             const double dp_recomputed = sum_pair_costs(points, dp.pairs);
             const double smawk_recomputed = sum_pair_costs(points, paper_smawk.pairs);
             const double scan_recomputed = sum_pair_costs(points, paper_scan.pairs);
+            const double optimized_recomputed = sum_pair_costs(points, optimized.pairs);
 
             bool ok = matching_is_perfect(n, dp.pairs) &&
                       matching_is_perfect(n, paper_smawk.pairs) &&
                       matching_is_perfect(n, paper_scan.pairs) &&
+                      matching_is_perfect(n, optimized.pairs) &&
                       std::abs(dp.cost - dp_recomputed) < kCostTolerance &&
                       std::abs(paper_smawk.cost - smawk_recomputed) < kCostTolerance &&
                       std::abs(paper_scan.cost - scan_recomputed) < kCostTolerance &&
+                      std::abs(optimized.cost - optimized_recomputed) < kCostTolerance &&
                       std::abs(dp.cost - paper_smawk.cost) < kCostTolerance &&
-                      std::abs(dp.cost - paper_scan.cost) < kCostTolerance;
+                      std::abs(dp.cost - paper_scan.cost) < kCostTolerance &&
+                      std::abs(dp.cost - optimized.cost) < kCostTolerance;
 
             if (ran_brute) {
                 ok = ok && matching_is_perfect(n, brute.pairs) &&
@@ -475,8 +535,8 @@ int run_benchmark(const BenchmarkOptions& opts) {
 
         if ((t + 1) % 100 == 0 || t + 1 == opts.trials) {
             const double sample_cost = run_dp     ? dp.cost
-                                       : run_smawk ? paper_smawk.cost
-                                                   : paper_scan.cost;
+                                       : run_smawk ? paper_smawk_cost
+                                                   : paper_scan_cost;
             std::cout << "  trial " << (t + 1) << "/" << opts.trials
                       << " n=" << n << " cost=" << sample_cost << "\n";
         }
@@ -493,16 +553,23 @@ int run_benchmark(const BenchmarkOptions& opts) {
     std::cout << "DP                       : " << trials_dp << " trials, total "
               << fmt_ms(total_ns_dp) << " ms\n";
     if (run_smawk) {
-        std::cout << "Marcotte & Suri (SMAWK)  : " << trials_paper_smawk
+        std::cout << (opts.optimized && !opts.validate
+                          ? "Optimized exact         : "
+                          : "Marcotte & Suri (SMAWK)  : ")
+                  << trials_paper_smawk
                   << " trials, total " << fmt_ms(total_ns_paper_smawk) << " ms\n";
     }
     if (run_scan) {
         std::cout << "Marcotte & Suri (scan)   : " << trials_paper_scan
                   << " trials, total " << fmt_ms(total_ns_paper_scan) << " ms\n";
     }
+    if (opts.validate) {
+        std::cout << "Optimized exact          : " << trials_optimized
+                  << " trials, total " << fmt_ms(total_ns_optimized) << " ms\n";
+    }
 
     if (opts.validate) {
-        std::cout << "\nVALIDATION OK: BF / DP / Paper (SMAWK) / Paper (scan) "
+        std::cout << "\nVALIDATION OK: BF / DP / Paper (SMAWK) / Paper (scan) / Optimized "
                      "all agreed within tolerance " << kCostTolerance << ".\n";
     }
     return 0;

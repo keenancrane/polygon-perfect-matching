@@ -33,4 +33,15 @@ MatchingResult dp_matching(const std::vector<Point>& points);
 MatchingResult marcotte_suri_matching(const std::vector<Point>& points,
                                       bool simple_scan = false);
 
+// Same algorithm and cost as marcotte_suri_matching, but skips constructing
+// the output pair list. Intended for benchmark/challenge modes that only need
+// the optimum objective value.
+double marcotte_suri_cost(const std::vector<Point>& points,
+                          bool simple_scan = false);
+
+// Exact hybrid used for performance sweeps: optimized interval DP for tiny
+// inputs, tuned Marcotte-Suri/SMAWK for larger inputs.
+MatchingResult optimized_matching(const std::vector<Point>& points);
+double optimized_cost(const std::vector<Point>& points);
+
 }  // namespace mwpm

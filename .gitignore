@@ -1,1 +1,6 @@
 .DS_Store
+build*/
+clang-pgo*/
+pgo-data/
+*.profraw
+*.profdata

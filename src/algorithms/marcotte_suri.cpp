@@ -35,15 +35,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace mwpm {
 
 namespace {
+
+constexpr std::size_t kHybridDpLimit = 50;
+constexpr std::size_t kHybridScanLimit = 128;
+constexpr std::size_t kDirectScanCellThreshold = 64;
 
 // =========================================================================
 // Scratch buffers
@@ -53,6 +59,11 @@ namespace {
 // passed by reference through the entire computation. Every transient vector
 // inside the conquer phase and SMAWK lives here. Within one call, buffers
 // are reused freely; nothing is freed until the Scratch goes out of scope.
+
+struct SmawkArithScratch {
+    std::vector<std::vector<int>> reduced_cols;
+    std::vector<std::vector<int>> odd_results;
+};
 
 struct Scratch {
     // --- conquer phase ---
@@ -67,22 +78,11 @@ struct Scratch {
     std::vector<int> g1_partner;     // size m
     std::vector<int> g2_partner;     // size r - m
     std::vector<std::uint8_t> alive; // size N
-    std::vector<int> survivors;      // scratch for the breakthrough loops
 
     // --- SMAWK ---
-    // The recursion in solve_smawk_impl uses one (rows_odd, cols_reduced,
-    // M_odd) triple per recursion depth. Depth never exceeds log2(N), so we
-    // grow these vector-of-vectors lazily.
-    std::vector<std::vector<int>> smawk_rows_odd;
-    std::vector<std::vector<int>> smawk_cols_reduced;
-    std::vector<std::vector<int>> smawk_M_odd;
-    std::vector<int> smawk_reduce_stack;
-    // Caller-supplied initial rows / cols and final result for the top-level
-    // SMAWK call inside each conquer phase. Kept separate from the per-level
-    // pools so the level-0 invocation does not alias its own rows_odd buffer.
-    std::vector<int> smawk_init_rows;
-    std::vector<int> smawk_init_cols;
-    std::vector<int> smawk_init_result;
+    std::vector<int> smawk_arith_cols;
+    std::vector<int> smawk_arith_result;
+    SmawkArithScratch smawk_arith;
 
     // --- find_matching_rec ---
     // Per-depth residual / extensible buffers for the two children of a
@@ -95,14 +95,6 @@ struct Scratch {
     // sized, references / pointers taken into the outer vectors stay stable
     // for the duration of the call. Growing mid-recursion would invalidate
     // every such reference, so we never do that.
-    void ensure_smawk_depth(std::size_t d) {
-        if (smawk_rows_odd.size() < d) {
-            smawk_rows_odd.resize(d);
-            smawk_cols_reduced.resize(d);
-            smawk_M_odd.resize(d);
-        }
-    }
-
     void ensure_recursion_depth(std::size_t levels) {
         const std::size_t need = 2 * levels;
         if (residual_pool.size() < need) {
@@ -112,135 +104,123 @@ struct Scratch {
     }
 };
 
+void prepare_scratch(Scratch& scratch) {
+    // The matching recursion halves the slice length at each step, so its
+    // depth is at most ceil(log2(N / 2)) + 1; padding to 64 levels handles
+    // any input size up to 2^64.
+    constexpr std::size_t kMaxDepth = 64;
+    scratch.ensure_recursion_depth(kMaxDepth);
+}
+
 // =========================================================================
 // SMAWK row-minima for a totally monotone matrix
 // =========================================================================
 //
-// `solve_smawk(rows, cols, A, out)` writes, for each row index in `rows`, the
-// column index from `cols` that achieves the row minimum. Both `rows` and
-// `cols` must be sorted in increasing order. `A(row_idx, col_idx)` evaluates
-// the (row, col) entry on demand. Ties are broken in favour of the leftmost
-// column (matching the strict-< comparison used by the simple-scan reference
-// path so the two MS variants produce the same matching).
+// `solve_smawk_arith_rows_into(row0, row_step, row_count, cols, A, out, ...)`
+// writes, for each arithmetic row index, the column index from `cols` that
+// achieves the row minimum. `A(row_idx, col_idx)` evaluates the entry on
+// demand. Ties are broken in favour of the leftmost column (matching the
+// strict-< comparison used by the simple-scan reference path).
 //
 // Reference: Aggarwal, Klawe, Moran, Shor, Wilber, "Geometric applications of
 // a matrix-searching algorithm", Algorithmica 2 (1987), pp. 209-233.
 
 template <typename F>
-void smawk_reduce_into(const std::vector<int>& rows,
-                       const std::vector<int>& cols,
-                       F& A,
-                       std::vector<int>& stack,
-                       std::vector<int>& out) {
-    // REDUCE: keep at most |rows| candidate columns. The stack holds the
-    // current candidates in the order they were accepted; at any point, if
-    // `stack` has k entries then entry k - 1 beats every later-popped column
-    // at row rows[k - 1].
-    //
-    // We pop on strict-> ("top is strictly worse than the new column at the
-    // diagnostic row") so that ties keep the earlier column on the stack,
-    // matching the leftmost-min tie-break used downstream.
-    stack.clear();
-    const std::size_t cap = rows.size();
-    stack.reserve(cap);
-    for (const int c : cols) {
-        while (!stack.empty()) {
-            const std::size_t k = stack.size() - 1;
-            if (A(rows[k], stack.back()) > A(rows[k], c)) {
-                stack.pop_back();
+void smawk_reduce_arith_rows_into(int row0,
+                                  int row_step,
+                                  int row_count,
+                                  const std::vector<int>& cols,
+                                  F& A,
+                                  std::vector<int>& out) {
+    out.clear();
+    out.reserve(static_cast<std::size_t>(row_count));
+    for (int c : cols) {
+        while (!out.empty()) {
+            const int row = row0 + row_step * static_cast<int>(out.size() - 1);
+            if (A(row, out.back()) > A(row, c)) {
+                out.pop_back();
             } else {
                 break;
             }
         }
-        if (stack.size() < cap) {
-            stack.push_back(c);
+        if (static_cast<int>(out.size()) < row_count) {
+            out.push_back(c);
         }
-        // Otherwise we already have |rows| candidates and no later column
-        // could displace any of them, so c is dropped.
     }
-    out.assign(stack.begin(), stack.end());
 }
 
 template <typename F>
-void solve_smawk_impl(Scratch& s,
-                      std::size_t level,
-                      const std::vector<int>& rows,
-                      const std::vector<int>& cols,
-                      F& A,
-                      std::vector<int>& result_out) {
-    if (rows.empty()) {
-        result_out.clear();
-        return;
-    }
-    // SMAWK pool is pre-grown at the top of marcotte_suri_matching.
-    assert(level < s.smawk_rows_odd.size());
+void solve_smawk_arith_rows_into(int row0,
+                                 int row_step,
+                                 int row_count,
+                                 const std::vector<int>& cols,
+                                 F& A,
+                                 std::vector<int>& result,
+                                 SmawkArithScratch& scratch,
+                                 int depth = 0) {
+    result.resize(static_cast<std::size_t>(row_count));
+    if (row_count == 0) return;
 
-    // Step 1: REDUCE when there are more cols than rows. Cp is either the
-    // freshly reduced column list (owned by this level's scratch) or just
-    // the caller's `cols` if no reduction was needed.
-    std::vector<int>& Cp_buf = s.smawk_cols_reduced[level];
-    const std::vector<int>* Cp_ptr;
-    if (cols.size() > rows.size()) {
-        smawk_reduce_into(rows, cols, A, s.smawk_reduce_stack, Cp_buf);
-        Cp_ptr = &Cp_buf;
-    } else {
-        Cp_ptr = &cols;
-    }
-    const std::vector<int>& Cp = *Cp_ptr;
-
-    // Step 2: build odd-indexed rows and recurse. Each level uses its own
-    // rows_odd buffer so the const reference `rows` (which may alias the
-    // parent's rows_odd buffer) stays valid for the INTERPOLATE step.
-    std::vector<int>& rows_odd = s.smawk_rows_odd[level];
-    rows_odd.clear();
-    rows_odd.reserve(rows.size() / 2);
-    for (std::size_t k = 1; k < rows.size(); k += 2) {
-        rows_odd.push_back(rows[k]);
+    if (scratch.reduced_cols.size() < 64) {
+        scratch.reduced_cols.resize(64);
+        scratch.odd_results.resize(64);
+    } else if (static_cast<int>(scratch.reduced_cols.size()) <= depth) {
+        const std::size_t new_size = scratch.reduced_cols.size() * 2;
+        scratch.reduced_cols.resize(new_size);
+        scratch.odd_results.resize(new_size);
     }
 
-    std::vector<int>& M_odd = s.smawk_M_odd[level];
-    solve_smawk_impl(s, level + 1, rows_odd, Cp, A, M_odd);
+    const std::vector<int>* Cp = &cols;
+    if (static_cast<int>(cols.size()) > row_count) {
+        auto& reduced = scratch.reduced_cols[static_cast<std::size_t>(depth)];
+        smawk_reduce_arith_rows_into(row0, row_step, row_count, cols, A, reduced);
+        Cp = &reduced;
+    }
 
-    // Step 3: INTERPOLATE for even-indexed rows. Their minimum columns are
-    // bracketed in Cp by the neighbouring odd rows' minima, so a single
-    // forward sweep with a running `cp_pos` finds the bracket in amortised
-    // O(|Cp|) total work across all rows.
-    result_out.assign(rows.size(), 0);
-    int* const result_data = result_out.data();
-    const int* const Cp_data = Cp.data();
-    const int Cp_size = static_cast<int>(Cp.size());
+    const int odd_count = row_count / 2;
+    auto& M_odd = scratch.odd_results[static_cast<std::size_t>(depth)];
+    solve_smawk_arith_rows_into(row0 + row_step, row_step * 2, odd_count,
+                                *Cp, A, M_odd, scratch, depth + 1);
 
+    const std::vector<int>& C = *Cp;
     int cp_pos = 0;
-    for (std::size_t k = 0; k < rows.size(); ++k) {
-        if ((k & 1u) == 1u) {
-            // Odd row already solved.
-            const int m_col = M_odd[k >> 1];
-            result_data[k] = m_col;
-            while (cp_pos < Cp_size && Cp_data[cp_pos] != m_col) ++cp_pos;
-            assert(cp_pos < Cp_size);
+    for (int k = 0; k < row_count; ++k) {
+        if ((k & 1) == 1) {
+            const int m_col = M_odd[static_cast<std::size_t>(k / 2)];
+            result[static_cast<std::size_t>(k)] = m_col;
+            while (cp_pos < static_cast<int>(C.size()) &&
+                   C[static_cast<std::size_t>(cp_pos)] != m_col) {
+                ++cp_pos;
+            }
+            assert(cp_pos < static_cast<int>(C.size()));
         } else {
             const int lo = (k > 0) ? cp_pos : 0;
             int hi;
-            if (k + 1 < rows.size()) {
+            if (k + 1 < row_count) {
                 int t = lo;
-                const int target = M_odd[k >> 1];
-                while (t < Cp_size && Cp_data[t] != target) ++t;
-                assert(t < Cp_size);
+                const int target = M_odd[static_cast<std::size_t>(k / 2)];
+                while (t < static_cast<int>(C.size()) &&
+                       C[static_cast<std::size_t>(t)] != target) {
+                    ++t;
+                }
+                assert(t < static_cast<int>(C.size()));
                 hi = t;
             } else {
-                hi = Cp_size - 1;
+                hi = static_cast<int>(C.size()) - 1;
             }
             assert(lo <= hi);
-            int best_col = Cp_data[lo];
-            double best_val = A(rows[k], Cp_data[lo]);
+            const int row = row0 + row_step * k;
+            int best_col = C[static_cast<std::size_t>(lo)];
+            double best_val = A(row, best_col);
             for (int idx = lo + 1; idx <= hi; ++idx) {
-                const double v = A(rows[k], Cp_data[idx]);
+                const int col = C[static_cast<std::size_t>(idx)];
+                const double v = A(row, col);
                 if (v < best_val) {
                     best_val = v;
-                    best_col = Cp_data[idx];
+                    best_col = col;
                 }
             }
-            result_data[k] = best_col;
+            result[static_cast<std::size_t>(k)] = best_col;
         }
     }
 }
@@ -259,15 +239,19 @@ void solve_smawk_impl(Scratch& s,
 // access to the original-input index and the Point of any conquer-phase
 // label without further branching.
 //
-// `out_extensible` is appended to (not cleared). `out_residual` is overwritten.
+// `out_extensible` is appended to (not cleared) when `collect_pairs` is true.
+// `out_residual` is overwritten. `out_cost` accumulates the cost of every
+// extensible edge produced during this conquer phase.
 
 void run_conquer(Scratch& s,
                  const std::vector<Point>& points,
                  const std::size_t* R, std::size_t R_size,
                  const std::size_t* L, std::size_t L_size,
                  bool simple_scan,
+                 bool collect_pairs,
                  std::vector<Pair>& out_extensible,
-                 std::vector<std::size_t>& out_residual) {
+                 std::vector<std::size_t>& out_residual,
+                 double& out_cost) {
     const std::size_t N = R_size + L_size;
     assert(R_size % 2 == 0 && L_size % 2 == 0);
     out_residual.clear();
@@ -278,6 +262,31 @@ void run_conquer(Scratch& s,
         out_residual.reserve(2);
         out_residual.insert(out_residual.end(), R, R + R_size);
         out_residual.insert(out_residual.end(), L, L + L_size);
+        return;
+    }
+    if (N == 4 && R_size == 2 && L_size == 2) {
+        const std::size_t a = R[0];
+        const std::size_t b = R[1];
+        const std::size_t c = L[0];
+        const std::size_t d = L[1];
+        const double boundary = distance(points[a], points[b]) +
+                                distance(points[c], points[d]);
+        const double through_middle = distance(points[b], points[c]) +
+                                      distance(points[a], points[d]);
+        if (through_middle < boundary) {
+            out_cost += distance(points[b], points[c]);
+            if (collect_pairs) {
+                out_extensible.emplace_back(b, c);
+            }
+            out_residual.push_back(a);
+            out_residual.push_back(d);
+        } else {
+            out_residual.reserve(4);
+            out_residual.push_back(a);
+            out_residual.push_back(b);
+            out_residual.push_back(c);
+            out_residual.push_back(d);
+        }
         return;
     }
 
@@ -329,8 +338,11 @@ void run_conquer(Scratch& s,
     g1_partner.assign(static_cast<std::size_t>(m), -1);
     g2_partner.assign(static_cast<std::size_t>(r - m), -1);
 
-    if (simple_scan) {
-        // O(|R| * |L|) reference path.
+    const std::size_t cross_cells =
+        static_cast<std::size_t>(m) * static_cast<std::size_t>(r - m);
+    if (simple_scan || cross_cells <= kDirectScanCellThreshold) {
+        // O(|R| * |L|) reference path. For tiny matrices this is cheaper than
+        // setting up SMAWK's recursive row/column work buffers.
         for (int i = 0; i < m; ++i) {
             double best = std::numeric_limits<double>::infinity();
             int best_j = -1;
@@ -360,13 +372,10 @@ void run_conquer(Scratch& s,
         // so the weighted-distance matrix is totally monotone in the standard
         // (row-minima-shift-right) form.
 
-        // G_1: rows index R top-to-bottom (SMAWK row k <-> x_{m-1-k}). Cols
-        // index L top-to-bottom (already the natural order).
-        auto& rows1 = s.smawk_init_rows;
-        auto& cols1 = s.smawk_init_cols;
-        rows1.resize(static_cast<std::size_t>(m));
+        // G_1: arithmetic rows index R top-to-bottom
+        // (SMAWK row k <-> x_{m-1-k}). Cols index L top-to-bottom.
+        auto& cols1 = s.smawk_arith_cols;
         cols1.resize(static_cast<std::size_t>(r - m));
-        std::iota(rows1.begin(), rows1.end(), 0);
         std::iota(cols1.begin(), cols1.end(), 0);
         const int m_local = m;
         auto A_g1 = [&D_orig, m_local](int row, int col) -> double {
@@ -374,29 +383,26 @@ void run_conquer(Scratch& s,
             const int y_idx = m_local + col;
             return D_orig(x_idx, y_idx);
         };
-        auto& mins1 = s.smawk_init_result;
-        solve_smawk_impl(s, 0, rows1, cols1, A_g1, mins1);
+        auto& mins1 = s.smawk_arith_result;
+        solve_smawk_arith_rows_into(0, 1, m, cols1, A_g1, mins1, s.smawk_arith);
         for (std::size_t k = 0; k < mins1.size(); ++k) {
             const int x_idx = m - 1 - static_cast<int>(k);
             const int y_idx = m + mins1[k];
             g1_partner[static_cast<std::size_t>(x_idx)] = y_idx;
         }
 
-        // G_2: rows index L top-to-bottom (natural). Cols index R top-to-
-        // bottom (SMAWK col l <-> y_{m-1-l}).
-        auto& rows2 = s.smawk_init_rows;
-        auto& cols2 = s.smawk_init_cols;
-        rows2.resize(static_cast<std::size_t>(r - m));
+        // G_2: arithmetic rows index L top-to-bottom (natural). Cols index R
+        // top-to-bottom (SMAWK col l <-> y_{m-1-l}).
+        auto& cols2 = s.smawk_arith_cols;
         cols2.resize(static_cast<std::size_t>(m));
-        std::iota(rows2.begin(), rows2.end(), 0);
         std::iota(cols2.begin(), cols2.end(), 0);
         auto A_g2 = [&D_orig, m_local](int row, int col) -> double {
             const int x_idx = m_local + row;
             const int y_idx = m_local - 1 - col;
             return D_orig(x_idx, y_idx);
         };
-        auto& mins2 = s.smawk_init_result;
-        solve_smawk_impl(s, 0, rows2, cols2, A_g2, mins2);
+        auto& mins2 = s.smawk_arith_result;
+        solve_smawk_arith_rows_into(0, 1, r - m, cols2, A_g2, mins2, s.smawk_arith);
         for (std::size_t k = 0; k < mins2.size(); ++k) {
             const int y_idx = m - 1 - mins2[k];
             g2_partner[k] = y_idx;
@@ -520,21 +526,28 @@ void run_conquer(Scratch& s,
             assert(i < j);
             // Pair up alive points strictly between x_i and y_j (inclusive
             // of y_i and x_j, the literal extensible-set endpoints).
-            auto& sb = s.survivors;
-            sb.clear();
-            sb.reserve(static_cast<std::size_t>(2 * (j - i)));
-            for (int pos = 2 * i + 1; pos <= 2 * j; ++pos) {
-                if (alive[static_cast<std::size_t>(pos)]) sb.push_back(pos);
-            }
-            assert(sb.size() % 2 == 0);
             const std::size_t* const cog = combined_orig.data();
-            for (std::size_t k = 0; k + 1 < sb.size(); k += 2) {
-                const int a = sb[k];
-                const int b = sb[k + 1];
-                out_extensible.emplace_back(cog[a], cog[b]);
-                alive[static_cast<std::size_t>(a)] = 0;
-                alive[static_cast<std::size_t>(b)] = 0;
+            int pending = -1;
+            int survivor_count = 0;
+            for (int pos = 2 * i + 1; pos <= 2 * j; ++pos) {
+                if (!alive[static_cast<std::size_t>(pos)]) continue;
+                ++survivor_count;
+                if (pending < 0) {
+                    pending = pos;
+                } else {
+                    const std::size_t orig_a = cog[static_cast<std::size_t>(pending)];
+                    const std::size_t orig_b = cog[static_cast<std::size_t>(pos)];
+                    out_cost += distance(points[orig_a], points[orig_b]);
+                    if (collect_pairs) {
+                        out_extensible.emplace_back(orig_a, orig_b);
+                    }
+                    alive[static_cast<std::size_t>(pending)] = 0;
+                    alive[static_cast<std::size_t>(pos)] = 0;
+                    pending = -1;
+                }
             }
+            assert(survivor_count % 2 == 0);
+            assert(pending < 0);
             // Paper line 17: List_2 edges with deleted endpoints are skipped
             // lazily inside advance_g2(); nothing to do here.
             // Paper line 18: delta := u_i + v_j - d(x_i, y_j).
@@ -548,21 +561,28 @@ void run_conquer(Scratch& s,
             const int p = crit2_p;
             const int q = crit2_q;
             assert(p > q + 1);
-            auto& sb = s.survivors;
-            sb.clear();
-            sb.reserve(static_cast<std::size_t>(2 * (p - q)));
-            for (int pos = 2 * q + 2; pos <= 2 * p - 1; ++pos) {
-                if (alive[static_cast<std::size_t>(pos)]) sb.push_back(pos);
-            }
-            assert(sb.size() % 2 == 0);
             const std::size_t* const cog = combined_orig.data();
-            for (std::size_t k = 0; k + 1 < sb.size(); k += 2) {
-                const int a = sb[k];
-                const int b = sb[k + 1];
-                out_extensible.emplace_back(cog[a], cog[b]);
-                alive[static_cast<std::size_t>(a)] = 0;
-                alive[static_cast<std::size_t>(b)] = 0;
+            int pending = -1;
+            int survivor_count = 0;
+            for (int pos = 2 * q + 2; pos <= 2 * p - 1; ++pos) {
+                if (!alive[static_cast<std::size_t>(pos)]) continue;
+                ++survivor_count;
+                if (pending < 0) {
+                    pending = pos;
+                } else {
+                    const std::size_t orig_a = cog[static_cast<std::size_t>(pending)];
+                    const std::size_t orig_b = cog[static_cast<std::size_t>(pos)];
+                    out_cost += distance(points[orig_a], points[orig_b]);
+                    if (collect_pairs) {
+                        out_extensible.emplace_back(orig_a, orig_b);
+                    }
+                    alive[static_cast<std::size_t>(pending)] = 0;
+                    alive[static_cast<std::size_t>(pos)] = 0;
+                    pending = -1;
+                }
             }
+            assert(survivor_count % 2 == 0);
+            assert(pending < 0);
             // Paper line 22: delta := -u_p - v_q + d(x_p, y_q).
             delta = -u[static_cast<std::size_t>(p)] -
                     v[static_cast<std::size_t>(q)] +
@@ -584,9 +604,9 @@ void run_conquer(Scratch& s,
 //
 // Operates on a CCW-contiguous slice of the original `indices` array via the
 // (indices_begin, n) view. The descent never copies P1 / P2. Each level
-// writes its residual and extensible into caller-provided buffers
-// (`out_residual`, `out_extensible`); the buffers at depth+1 used to hold
-// the two children's outputs come from the per-depth scratch pool.
+// writes its residual, optional extensible pairs, and accumulated cost into
+// caller-provided outputs. The buffers at depth+1 used to hold the two
+// children's outputs come from the per-depth scratch pool.
 
 void find_matching_rec(Scratch& s,
                        std::size_t depth,
@@ -594,11 +614,16 @@ void find_matching_rec(Scratch& s,
                        const std::size_t* indices_begin,
                        std::size_t n,
                        bool simple_scan,
+                       bool collect_pairs,
+                       int parallel_depth,
+                       std::size_t parallel_cutoff,
                        std::vector<std::size_t>& out_residual,
-                       std::vector<Pair>& out_extensible) {
+                       std::vector<Pair>& out_extensible,
+                       double& out_cost) {
     assert(n % 2 == 0);
     out_residual.clear();
     out_extensible.clear();
+    out_cost = 0.0;
     if (n == 0) return;
     if (n == 2) {
         out_residual.assign(indices_begin, indices_begin + n);
@@ -620,40 +645,71 @@ void find_matching_rec(Scratch& s,
     auto& r2_residual   = s.residual_pool[child_slot + 1];
     auto& r1_extensible = s.extensible_pool[child_slot + 0];
     auto& r2_extensible = s.extensible_pool[child_slot + 1];
+    double r1_cost = 0.0;
+    double r2_cost = 0.0;
 
-    // Paper line 2: recurse on the two halves.
-    find_matching_rec(s, depth + 1, points,
-                      indices_begin, split,
-                      simple_scan,
-                      r1_residual, r1_extensible);
-    find_matching_rec(s, depth + 1, points,
-                      indices_begin + split, n - split,
-                      simple_scan,
-                      r2_residual, r2_extensible);
+    // Paper line 2: recurse on the two halves. For large inputs the two
+    // subproblems are independent; give the spawned branch its own Scratch so
+    // no transient buffers are shared across threads.
+    if (parallel_depth > 0 && n >= parallel_cutoff) {
+        Scratch left_scratch;
+        prepare_scratch(left_scratch);
+        auto left = std::async(std::launch::async, [&]() {
+            find_matching_rec(left_scratch, depth + 1, points,
+                              indices_begin, split,
+                              simple_scan, collect_pairs,
+                              parallel_depth - 1, parallel_cutoff,
+                              r1_residual, r1_extensible, r1_cost);
+        });
+        find_matching_rec(s, depth + 1, points,
+                          indices_begin + split, n - split,
+                          simple_scan, collect_pairs,
+                          parallel_depth - 1, parallel_cutoff,
+                          r2_residual, r2_extensible, r2_cost);
+        left.get();
+    } else {
+        find_matching_rec(s, depth + 1, points,
+                          indices_begin, split,
+                          simple_scan, collect_pairs,
+                          0, parallel_cutoff,
+                          r1_residual, r1_extensible, r1_cost);
+        find_matching_rec(s, depth + 1, points,
+                          indices_begin + split, n - split,
+                          simple_scan, collect_pairs,
+                          0, parallel_cutoff,
+                          r2_residual, r2_extensible, r2_cost);
+    }
+    out_cost = r1_cost + r2_cost;
 
     // Paper line 3: M starts as the union of every extensible-set edge
     // collected below this level. The conquer step (line 4 onwards) will
     // append further extensible edges into out_extensible.
-    out_extensible.reserve(r1_extensible.size() + r2_extensible.size());
-    out_extensible.insert(out_extensible.end(),
-                          r1_extensible.begin(), r1_extensible.end());
-    out_extensible.insert(out_extensible.end(),
-                          r2_extensible.begin(), r2_extensible.end());
+    if (collect_pairs) {
+        out_extensible.reserve(r1_extensible.size() + r2_extensible.size());
+        out_extensible.insert(out_extensible.end(),
+                              r1_extensible.begin(), r1_extensible.end());
+        out_extensible.insert(out_extensible.end(),
+                              r2_extensible.begin(), r2_extensible.end());
+    }
 
     // Paper line 4: conquer the union of the two residuals. R is from P_1,
     // L from P_2, both already in CCW order.
     run_conquer(s, points,
                 r1_residual.data(), r1_residual.size(),
                 r2_residual.data(), r2_residual.size(),
-                simple_scan,
+                simple_scan, collect_pairs,
                 out_extensible,
-                out_residual);
+                out_residual,
+                out_cost);
 }
 
 }  // namespace
 
-MatchingResult marcotte_suri_matching(const std::vector<Point>& points,
-                                      bool simple_scan) {
+namespace {
+
+MatchingResult run_marcotte_suri(const std::vector<Point>& points,
+                                 bool simple_scan,
+                                 bool collect_pairs) {
     if (points.size() % 2 != 0) {
         throw std::invalid_argument("marcotte_suri_matching requires an even number of points");
     }
@@ -670,45 +726,77 @@ MatchingResult marcotte_suri_matching(const std::vector<Point>& points,
     std::iota(indices.begin(), indices.end(), std::size_t{0});
 
     // Pre-grow every per-depth pool to its worst-case length once, before any
-    // references into these pools are taken. After this point, no buffer
-    // grows the outer vector-of-vectors, so references / pointers into the
-    // pool stay stable for the rest of the call.
-    //
-    // The matching recursion halves the slice length at each step, so its
-    // depth is at most ceil(log2(N / 2)) + 1; padding to 64 levels handles
-    // any input size up to 2^64. SMAWK has the same log2(N) bound on
-    // recursion depth. Both pools are vectors of empty vectors, so the
-    // reserved-but-unused entries cost only a few bytes each. With a
-    // thread_local Scratch, this resize is a no-op after the first call on a
-    // given thread.
-    constexpr std::size_t kMaxDepth = 64;
-    scratch.ensure_recursion_depth(kMaxDepth);
-    scratch.ensure_smawk_depth(kMaxDepth);
+    // references into these pools are taken. With a thread_local Scratch, this
+    // is a no-op after the first call on a given thread.
+    prepare_scratch(scratch);
+
+    unsigned workers = std::thread::hardware_concurrency();
+    int parallel_depth = 0;
+    if (workers >= 2 && points.size() >= 512) parallel_depth = 1;
+    if (workers >= 4 && points.size() >= 1024) parallel_depth = 2;
+    if (workers >= 8 && points.size() >= 4096) parallel_depth = 3;
+    if (workers >= 16 && points.size() >= 32768) parallel_depth = 4;
+    const std::size_t parallel_cutoff = points.size() < 2048 ? 256 : 512;
 
     // Final output buffers live at the bottom of the per-depth pool (depth 0).
     auto& top_residual   = scratch.residual_pool[0];
     auto& top_extensible = scratch.extensible_pool[0];
+    double cost = 0.0;
 
     find_matching_rec(scratch, 0, points,
                       indices.data(), indices.size(),
-                      simple_scan,
-                      top_residual, top_extensible);
+                      simple_scan, collect_pairs,
+                      parallel_depth, parallel_cutoff,
+                      top_residual, top_extensible, cost);
 
     // Paper line 24 at the top level: pair the surviving residual points as
     // the boundary matching M_1 = {x_0 y_0, x_1 y_1, ...}.
     assert(top_residual.size() % 2 == 0);
-    result.pairs.reserve(top_extensible.size() + top_residual.size() / 2);
-    result.pairs = std::move(top_extensible);
-    for (std::size_t i = 0; i + 1 < top_residual.size(); i += 2) {
-        result.pairs.emplace_back(top_residual[i], top_residual[i + 1]);
+    if (collect_pairs) {
+        result.pairs = std::move(top_extensible);
+        result.pairs.reserve(result.pairs.size() + top_residual.size() / 2);
     }
-
-    double cost = 0.0;
-    for (const auto& [a, b] : result.pairs) {
+    for (std::size_t i = 0; i + 1 < top_residual.size(); i += 2) {
+        const std::size_t a = top_residual[i];
+        const std::size_t b = top_residual[i + 1];
         cost += distance(points[a], points[b]);
+        if (collect_pairs) {
+            result.pairs.emplace_back(a, b);
+        }
     }
     result.cost = cost;
     return result;
+}
+
+}  // namespace
+
+MatchingResult marcotte_suri_matching(const std::vector<Point>& points,
+                                      bool simple_scan) {
+    return run_marcotte_suri(points, simple_scan, /*collect_pairs=*/true);
+}
+
+double marcotte_suri_cost(const std::vector<Point>& points, bool simple_scan) {
+    return run_marcotte_suri(points, simple_scan, /*collect_pairs=*/false).cost;
+}
+
+MatchingResult optimized_matching(const std::vector<Point>& points) {
+    if (points.size() <= kHybridDpLimit) {
+        return dp_matching(points);
+    }
+    if (points.size() <= kHybridScanLimit) {
+        return marcotte_suri_matching(points, /*simple_scan=*/true);
+    }
+    return marcotte_suri_matching(points, /*simple_scan=*/false);
+}
+
+double optimized_cost(const std::vector<Point>& points) {
+    if (points.size() <= kHybridDpLimit) {
+        return dp_matching(points).cost;
+    }
+    if (points.size() <= kHybridScanLimit) {
+        return marcotte_suri_cost(points, /*simple_scan=*/true);
+    }
+    return marcotte_suri_cost(points, /*simple_scan=*/false);
 }
 
 }  // namespace mwpm
